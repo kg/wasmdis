@@ -1,9 +1,13 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text;
 using Gee.External.Capstone.X86;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Wasm.Model;
 
 namespace WasmDis {
@@ -15,7 +19,7 @@ namespace WasmDis {
             }
 
             var modulePath = args[0];
-            var outputPath = args[1];
+            var outputDir = args[1];
             Console.WriteLine($"Analyzing module {modulePath}...");
 
             WasmReader wasmReader;
@@ -43,11 +47,11 @@ namespace WasmDis {
             if (spidermonkeyPath == null)
                 throw new Exception("Spidermonkey not found in .jsvu directory");
 
-            if (!Directory.Exists(outputPath))
-                Directory.CreateDirectory(outputPath);
+            if (!Directory.Exists(outputDir))
+                Directory.CreateDirectory(outputDir);
 
             var driverPath = Path.Combine(appDir, "spidermonkey-driver.js");
-            var smArgs = $"\"{driverPath}\" \"{modulePath}\" \"{outputPath}\\temp\"";
+            var smArgs = $"\"{driverPath}\" \"{modulePath}\" \"{outputDir}\\wasm\"";
             var psi = new ProcessStartInfo(spidermonkeyPath, smArgs) {
                 UseShellExecute = false,
                 // CreateNoWindow = true
@@ -57,21 +61,69 @@ namespace WasmDis {
             using (var proc = Process.Start(psi))
                 proc.WaitForExit();
 
-            var segmentsPath = Path.Combine(outputPath, "temp.segments.json");
-            var binaryPath = Path.Combine(outputPath, "temp.bin");
+            var segmentsPath = Path.Combine(outputDir, "wasm.segments.json");
+            var binaryPath = Path.Combine(outputDir, "wasm.bin");
 
             if (!File.Exists(binaryPath) || !File.Exists(segmentsPath))
                 throw new Exception("Output from driver not found");
 
+            Console.WriteLine("Processing segment data...");
+
+            var segments = new List<WasmSegment>();
+
+            using (var streamReader = new StreamReader(segmentsPath)) {
+                var jsonReader = new JsonTextReader(streamReader);
+                while (jsonReader.Read()) {
+                    if (jsonReader.TokenType == JsonToken.StartObject) {
+                        var jo = JObject.Load(jsonReader);
+                        var seg = jo.ToObject<WasmSegment>();
+
+                        if (seg.funcIndex.HasValue)
+                            wasmReader.FunctionNames.TryGetValue(seg.funcIndex.Value, out seg.name);
+
+                        segments.Add(seg);
+                    }
+                }
+            }
+
+            Console.WriteLine("Performing disassembly...");
+
+            var compiledBytes = File.ReadAllBytes(binaryPath);
+            var outputPath = Path.Combine(outputDir, "disassembly.txt");
+
+            Console.Write("...");
+
+            using (var outputStream = new StreamWriter(outputPath, false, Encoding.UTF8))
             using (var dis = new CapstoneX86Disassembler(X86DisassembleMode.Bit64) {
                 EnableInstructionDetails = true,
                 DisassembleSyntax = Gee.External.Capstone.DisassembleSyntax.Intel
             }) {
-                var bytes = new byte[0];
-                var insns = dis.Disassemble(bytes);
-                foreach (var insn in insns)
-                    Console.WriteLine(insn.Mnemonic, insn.Operand);
+                for (int i = 0; i < segments.Count; i++) {
+                    var segment = segments[i];
+                    if (!segment.funcBodyBegin.HasValue)
+                        continue;
+
+                    if (i % 5 == 0) {
+                        Console.CursorLeft = 0;
+                        Console.Write($" {i} / {segments.Count} ...      ");
+                    }
+
+                    var offset = segment.funcBodyBegin.Value;
+                    var count = (int)(segment.funcBodyEnd.Value - offset);
+
+                    outputStream.WriteLine($"{segment.name ?? "unnamed"} @ {offset:X8}");
+
+                    var insns = dis.Disassemble(compiledBytes, offset, count);
+                    foreach (var insn in insns)
+                        outputStream.WriteLine(insn.Mnemonic, insn.Operand);
+
+                    outputStream.WriteLine();
+                }
             }
+
+            Console.CursorLeft = 0;
+
+            Console.WriteLine($"Complete. Results written to {outputPath}.");
 
             if (Debugger.IsAttached) {
                 Console.WriteLine("Press enter to exit");
@@ -84,8 +136,8 @@ namespace WasmDis {
         public static void Assert (
             bool b,
             string description = null,
-            [CallerMemberName] string memberName = "",  
-            [CallerFilePath]   string sourceFilePath = "",  
+            [CallerMemberName] string memberName = "",
+            [CallerFilePath]   string sourceFilePath = "",
             [CallerLineNumber] int sourceLineNumber = 0
         ) {
             if (!b)
@@ -95,7 +147,7 @@ namespace WasmDis {
                     memberName, Path.GetFileName(sourceFilePath), sourceLineNumber
                 ));
         }
- 
+
         public static string GetPathOfAssembly (Assembly assembly) {
             var uri = new Uri(assembly.CodeBase);
             var result = Uri.UnescapeDataString(uri.AbsolutePath);
@@ -107,5 +159,15 @@ namespace WasmDis {
 
             return result;
         }
+    }
+
+    public struct WasmSegment {
+        public uint kind;
+        public long begin, end;
+
+        public uint? funcIndex;
+        public long? funcBodyBegin, funcBodyEnd;
+
+        public string name;
     }
 }
