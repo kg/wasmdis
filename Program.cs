@@ -120,7 +120,8 @@ namespace WasmDis {
                     }
 
                     var offset = segment.funcBodyBegin.Value;
-                    var count = (int)(segment.funcBodyEnd.Value - offset);
+                    var endOffset = segment.funcBodyEnd.Value;
+                    var count = (int)(endOffset - offset);
                     var name = segment.name;
 
                     if (functionNameRegex != null && !functionNameRegex.IsMatch(name))
@@ -128,19 +129,40 @@ namespace WasmDis {
 
                     outputStream.WriteLine($"// {name} @ {offset:X8}  size {count} byte(s)");
 
-                    var insns = dis.Disassemble(compiledBytes, offset, count);
-                    foreach (var insn in insns) {
-                        var operand = insn.Operand;
-                        if (
-                            insn.HasDetails && 
-                            (insn.Details.Operands.Length == 1) &&
-                            (insn.Details.Operands[0].Type == X86OperandType.Immediate)
-                        ) {
-                            operand = MapOffset(insn.Details.Operands[0].Immediate, segments);
+                    const int decodeChunkSize = 256;
+                    var decodeOffset = offset;
+                    do {
+                        var insns = dis.Disassemble(compiledBytes, decodeOffset, decodeChunkSize);
+
+                        for (int k = 0; k < insns.Length; k++) {
+                            var insn = insns[k];
+                            if (insn.Address >= endOffset)
+                                break;
+
+                            var operand = insn.Operand;
+                            if (
+                                insn.HasDetails &&
+                                (insn.Details.Operands.Length == 1) &&
+                                (insn.Details.Operands[0].Type == X86OperandType.Immediate)
+                            ) {
+                                operand = MapOffset(insn.Details.Operands[0].Immediate, segments);
+                            }
+
+                            outputStream.WriteLine($"{insn.Address:X8}  {insn.Mnemonic} {operand}");
                         }
 
-                        outputStream.WriteLine($"{insn.Address:X8}  {insn.Mnemonic} {operand}");
-                    }
+                        if (insns.Length >= decodeChunkSize) {
+                            var lastInsn = insns[insns.Length - 1];
+                            var lastAddress = (int)(lastInsn.Address);
+                            var nextAddress = lastAddress + lastInsn.Bytes.Length;
+                            if (nextAddress >= endOffset)
+                                break;
+                            else
+                                decodeOffset = nextAddress;
+                        } else {
+                            break;
+                        }
+                    } while (true);
 
                     outputStream.WriteLine($"// end of {name} @ {segment.funcBodyEnd.Value:X8}");
                     outputStream.WriteLine();
