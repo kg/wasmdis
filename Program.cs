@@ -130,7 +130,7 @@ namespace WasmDis {
                     if (functionNameRegex != null && !functionNameRegex.IsMatch(name))
                         continue;
 
-                    outputStream.WriteLine($"// {name} @ {offset:X8}");
+                    outputStream.WriteLine($"// {name}#{segment.funcIndex} @ {offset:X8}");
                     outputStream.WriteLine($"//    native size {count} byte(s)");
 
                     var bodyIndex = segment.funcIndex.Value - importCount;
@@ -154,7 +154,9 @@ namespace WasmDis {
                         var wasDead = false;
                         for (int k = 0; k < insns.Length; k++) {
                             var insn = insns[k];
-                            if (insn.Address > endOffset)
+                            if (insn.Address >= endOffset)
+                                break;
+                            if ((k == insns.Length - 1) && ((insn.Address + insn.Bytes.Length) >= endOffset))
                                 break;
 
                             // HACK: Strip dead instructions from the output because they're meaningless padding
@@ -187,7 +189,7 @@ namespace WasmDis {
                             var lastInsn = insns[insns.Length - 1];
                             var lastAddress = (int)(lastInsn.Address);
                             var nextAddress = lastAddress + lastInsn.Bytes.Length;
-                            if (nextAddress > endOffset)
+                            if (nextAddress >= endOffset)
                                 break;
                             else
                                 decodeOffset = nextAddress;
