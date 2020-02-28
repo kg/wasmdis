@@ -130,16 +130,21 @@ namespace WasmDis {
                     if (functionNameRegex != null && !functionNameRegex.IsMatch(name))
                         continue;
 
-                    var wasmBody = wasmReader.Code.bodies[segment.funcIndex.Value - importCount];
-
                     outputStream.WriteLine($"// {name} @ {offset:X8}");
-                    outputStream.WriteLine($"//    wasm size {wasmBody.body_size} byte(s)");
-                    if (wasmBody.locals.Length > 0) {
-                        outputStream.WriteLine($"//    wasm locals:");
-                        foreach (var le in wasmBody.locals)
-                            outputStream.WriteLine($"//      {le.type} x{le.count}");
-                    }
                     outputStream.WriteLine($"//    native size {count} byte(s)");
+
+                    var bodyIndex = segment.funcIndex.Value - importCount;
+                    // FIXME: Without the -importCount offset the function body for interp_exec_method is obviously wrong,
+                    //  but I'm not convinced this is right either. We should always have a valid index here.
+                    if (bodyIndex >= 0) {
+                        var wasmBody = wasmReader.Code.bodies[bodyIndex];
+                        outputStream.WriteLine($"//    wasm size {wasmBody.body_size} byte(s)");
+                        if (wasmBody.locals.Length > 0) {
+                            outputStream.WriteLine($"//    wasm locals:");
+                            foreach (var le in wasmBody.locals)
+                                outputStream.WriteLine($"//      {le.type} x{le.count}");
+                        }
+                    }
 
                     const int decodeChunkSize = 512;
                     var decodeOffset = offset;
