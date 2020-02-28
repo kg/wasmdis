@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -109,6 +110,8 @@ namespace WasmDis {
                 EnableInstructionDetails = true,
                 DisassembleSyntax = Gee.External.Capstone.DisassembleSyntax.Intel
             }) {
+                var importCount = wasmReader.Imports.entries.Count(imp => imp.kind == external_kind.Function);
+
                 for (int i = 0; i < segments.Count; i++) {
                     var segment = segments[i];
                     if (!segment.funcBodyBegin.HasValue)
@@ -127,18 +130,41 @@ namespace WasmDis {
                     if (functionNameRegex != null && !functionNameRegex.IsMatch(name))
                         continue;
 
-                    outputStream.WriteLine($"// {name} @ {offset:X8}  size {count} byte(s)");
+                    var wasmBody = wasmReader.Code.bodies[segment.funcIndex.Value - importCount];
 
-                    const int decodeChunkSize = 256;
+                    outputStream.WriteLine($"// {name} @ {offset:X8}");
+                    outputStream.WriteLine($"//    wasm size {wasmBody.body_size} byte(s)");
+                    if (wasmBody.locals.Length > 0) {
+                        outputStream.WriteLine($"//    wasm locals:");
+                        foreach (var le in wasmBody.locals)
+                            outputStream.WriteLine($"//      {le.type} x{le.count}");
+                    }
+                    outputStream.WriteLine($"//    native size {count} byte(s)");
+
+                    const int decodeChunkSize = 512;
                     var decodeOffset = offset;
                     do {
                         var insns = dis.Disassemble(compiledBytes, decodeOffset, decodeChunkSize);
 
+                        var wasDead = false;
                         for (int k = 0; k < insns.Length; k++) {
                             var insn = insns[k];
-                            if (insn.Address >= endOffset)
+                            if (insn.Address > endOffset)
                                 break;
 
+                            // HACK: Strip dead instructions from the output because they're meaningless padding
+                            var isDead = (insn.Mnemonic == "hlt");
+                            if (isDead) {
+                                if (!wasDead)
+                                    outputStream.WriteLine("...");
+                                wasDead = isDead;
+                                continue;
+                            } else {
+                                wasDead = false;
+                            }
+
+                            // If an instruction's operand is an address assign it a meaningful name+offset label if possible by
+                            //  looking it up in our table of code segments
                             var operand = insn.Operand;
                             if (
                                 insn.HasDetails &&
@@ -151,11 +177,12 @@ namespace WasmDis {
                             outputStream.WriteLine($"{insn.Address:X8}  {insn.Mnemonic} {operand}");
                         }
 
+                        // If we decoded the requested number of instructions, there are probably more left so keep going
                         if (insns.Length >= decodeChunkSize) {
                             var lastInsn = insns[insns.Length - 1];
                             var lastAddress = (int)(lastInsn.Address);
                             var nextAddress = lastAddress + lastInsn.Bytes.Length;
-                            if (nextAddress >= endOffset)
+                            if (nextAddress > endOffset)
                                 break;
                             else
                                 decodeOffset = nextAddress;

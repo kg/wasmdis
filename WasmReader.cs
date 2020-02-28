@@ -16,6 +16,7 @@ namespace WasmDis {
         public GlobalSection Globals;
         public ExportSection Exports;
         public ElementSection Elements;
+        public CodeSection Code;
 
         public readonly Dictionary<uint, string> FunctionNames = new Dictionary<uint, string>();
 
@@ -29,8 +30,6 @@ namespace WasmDis {
             Program.Assert(reader.ReadHeader(), "ReadHeader");
 
             SectionHeader sh;
-
-            CodeSection cs;
 
             while (reader.ReadSectionHeader(out sh)) {
                 switch (sh.id) {
@@ -64,7 +63,7 @@ namespace WasmDis {
                         break;
 
                     case SectionTypes.Code:
-                        Program.Assert(reader.ReadCodeSection(out cs));
+                        Program.Assert(reader.ReadCodeSection(out Code));
                         break;
 
                     case SectionTypes.Data:
