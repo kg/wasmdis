@@ -1,10 +1,10 @@
-var modulePath = scriptArgs[0], outputPath = scriptArgs[1];
+var modulePath = scriptArgs[0], outputPath = scriptArgs[1], tier = scriptArgs[2] || "stable";
 console.log("> loading module", modulePath);
 var bytes = os.file.readFile(modulePath, "binary");
 console.log("> compiling module");
 var m = new WebAssembly.Module(bytes);
-console.log("> extracting code");
-var c = wasmExtractCode(m);
+console.log("> extracting code for tier", tier);
+var c = wasmExtractCode(m, tier);
 console.log("> extracted", c.code.length, "bytes");
 var binPath = scriptArgs[1] + ".bin";
 console.log("> saving machine code to", binPath);

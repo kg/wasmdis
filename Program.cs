@@ -5,6 +5,7 @@ using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using Gee.External.Capstone.X86;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -13,13 +14,19 @@ using Wasm.Model;
 namespace WasmDis {
     class Program {
         public static int Main (string[] args) {
-            if (args.Length != 2) {
-                Console.Error.WriteLine("Usage: WasmDis module.wasm output-directory");
+            if (args.Length < 2) {
+                Console.Error.WriteLine("Usage: WasmDis module.wasm output-directory [function-name-regex] [compile-tier]");
+                Console.Error.WriteLine("  function-name-regex is a .NET Framework regular expression that must match for a function to be disassembled");
+                Console.Error.WriteLine("  compile-tier specifies which compilation tier should be used to generate native code from the webassembly module.");
+                Console.Error.WriteLine("  valid tiers: 'stable', 'best', 'baseline', or 'ion'; the default is 'stable'.");
                 return 1;
             }
 
             var modulePath = args[0];
             var outputDir = args[1];
+            Regex functionNameRegex = null;
+            if ((args.Length > 2) && !string.IsNullOrWhiteSpace(args[2]))
+                functionNameRegex = new Regex(args[2], RegexOptions.Compiled | RegexOptions.IgnoreCase);
             Console.WriteLine($"Analyzing module {modulePath}...");
 
             WasmReader wasmReader;
@@ -50,8 +57,10 @@ namespace WasmDis {
             if (!Directory.Exists(outputDir))
                 Directory.CreateDirectory(outputDir);
 
+            var compileTier = args.Length > 3 ? args[3] : "stable";
+
             var driverPath = Path.Combine(appDir, "spidermonkey-driver.js");
-            var smArgs = $"\"{driverPath}\" \"{modulePath}\" \"{outputDir}\\wasm\"";
+            var smArgs = $"\"{driverPath}\" \"{modulePath}\" \"{outputDir}\\wasm\" {compileTier}";
             var psi = new ProcessStartInfo(spidermonkeyPath, smArgs) {
                 UseShellExecute = false,
                 // CreateNoWindow = true
@@ -78,8 +87,10 @@ namespace WasmDis {
                         var jo = JObject.Load(jsonReader);
                         var seg = jo.ToObject<WasmSegment>();
 
-                        if (seg.funcIndex.HasValue)
-                            wasmReader.FunctionNames.TryGetValue(seg.funcIndex.Value, out seg.name);
+                        if (seg.funcIndex.HasValue) {
+                            if (!wasmReader.FunctionNames.TryGetValue(seg.funcIndex.Value, out seg.name))
+                                seg.name = $"unnamed{seg.funcIndex.Value:X4}";
+                        }
 
                         segments.Add(seg);
                     }
@@ -110,13 +121,28 @@ namespace WasmDis {
 
                     var offset = segment.funcBodyBegin.Value;
                     var count = (int)(segment.funcBodyEnd.Value - offset);
+                    var name = segment.name;
 
-                    outputStream.WriteLine($"{segment.name ?? "unnamed"} @ {offset:X8}");
+                    if (functionNameRegex != null && !functionNameRegex.IsMatch(name))
+                        continue;
+
+                    outputStream.WriteLine($"// {name} @ {offset:X8}  size {count} byte(s)");
 
                     var insns = dis.Disassemble(compiledBytes, offset, count);
-                    foreach (var insn in insns)
-                        outputStream.WriteLine(insn.Mnemonic, insn.Operand);
+                    foreach (var insn in insns) {
+                        var operand = insn.Operand;
+                        if (
+                            insn.HasDetails && 
+                            (insn.Details.Operands.Length == 1) &&
+                            (insn.Details.Operands[0].Type == X86OperandType.Immediate)
+                        ) {
+                            operand = MapOffset(insn.Details.Operands[0].Immediate, segments);
+                        }
 
+                        outputStream.WriteLine($"{insn.Address:X8}  {insn.Mnemonic} {operand}");
+                    }
+
+                    outputStream.WriteLine($"// end of {name} @ {segment.funcBodyEnd.Value:X8}");
                     outputStream.WriteLine();
                 }
             }
@@ -131,6 +157,21 @@ namespace WasmDis {
             }
 
             return 0;
+        }
+
+        static string MapOffset (long immediate, List<WasmSegment> segments) {
+            foreach (var seg in segments) {
+                if (!seg.funcBodyBegin.HasValue)
+                    continue;
+
+                if ((immediate < seg.funcBodyBegin.Value) || (immediate > seg.funcBodyEnd.Value))
+                    continue;
+
+                var offset = immediate - seg.funcBodyBegin.Value;
+                return $"0x{immediate:X8} ({seg.name} + 0x{offset:X4})";
+            }
+
+            return $"0x{immediate:X8}";
         }
 
         public static void Assert (
