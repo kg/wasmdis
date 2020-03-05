@@ -17,6 +17,8 @@ namespace WasmDis {
         public static int Main (string[] args) {
             if (args.Length < 2) {
                 Console.Error.WriteLine("Usage: WasmDis module.wasm output-directory [function-name-regex] [compile-tier]");
+                Console.Error.WriteLine("       WasmDis input-directory/module-name output-directory [function-name-regex]");
+                Console.Error.WriteLine("       (input-directory must point to a directory containing module-name.bin, module-name.wasm and module-name.segments.json files)");
                 Console.Error.WriteLine("  function-name-regex is a .NET Framework regular expression that must match for a function to be disassembled");
                 Console.Error.WriteLine("  compile-tier specifies which compilation tier should be used to generate native code from the webassembly module.");
                 Console.Error.WriteLine("  valid tiers: 'stable', 'best', 'baseline', or 'ion'; the default is 'stable'.");
@@ -30,49 +32,71 @@ namespace WasmDis {
                 functionNameRegex = new Regex(args[2], RegexOptions.Compiled | RegexOptions.IgnoreCase);
             Console.WriteLine($"Analyzing module {modulePath}...");
 
+            string segmentsPath, binaryPath;
+            bool usingExistingBinary = false;
+
+            BinaryReader wasmStream;
+            if (File.Exists(modulePath)) {
+                segmentsPath = Path.Combine(outputDir, "wasm.segments.json");
+                binaryPath = Path.Combine(outputDir, "wasm.bin");
+            } else {
+                usingExistingBinary = true;
+                segmentsPath = modulePath + ".segments.json";
+                binaryPath = modulePath + ".bin";
+                modulePath = modulePath + ".wasm";
+
+                if (!File.Exists(binaryPath))
+                    throw new Exception("Binary not found: " + binaryPath);
+                if (!File.Exists(segmentsPath))
+                    throw new Exception("Segments not found: " + segmentsPath);
+            }
+
+            if (!File.Exists(modulePath))
+                throw new Exception("Wasm module not found: " + modulePath);
+            wasmStream = new BinaryReader(File.OpenRead(modulePath), System.Text.Encoding.UTF8, false);
+
             WasmReader wasmReader;
-            using (var stream = new BinaryReader(File.OpenRead(modulePath), System.Text.Encoding.UTF8, false)) {
-                wasmReader = new WasmReader(stream);
+            using (wasmStream) {
+                wasmReader = new WasmReader(wasmStream);
                 wasmReader.Read();
             }
 
-            var appDir = Path.GetDirectoryName(GetPathOfAssembly(typeof(Program).Assembly));
+            if (!usingExistingBinary) {
+                var appDir = Path.GetDirectoryName(GetPathOfAssembly(typeof(Program).Assembly));
 
-            Console.WriteLine($"Compiling module in SpiderMonkey...");
+                Console.WriteLine($"Compiling module in SpiderMonkey...");
 
-            var jsvuDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".jsvu");
-            if (!Directory.Exists(jsvuDir))
-                throw new Exception("jsvu not found at " + jsvuDir);
+                var jsvuDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".jsvu");
+                if (!Directory.Exists(jsvuDir))
+                    throw new Exception("jsvu not found at " + jsvuDir);
 
-            var smNames = new[] { "sm.cmd", "sm" };
-            string spidermonkeyPath = null;
-            foreach (var smName in smNames) {
-                var testPath = Path.Combine(jsvuDir, smName);
-                if (File.Exists(testPath))
-                    spidermonkeyPath = testPath;
+                var smNames = new[] { "sm.cmd", "sm" };
+                string spidermonkeyPath = null;
+                foreach (var smName in smNames) {
+                    var testPath = Path.Combine(jsvuDir, smName);
+                    if (File.Exists(testPath))
+                        spidermonkeyPath = testPath;
+                }
+
+                if (spidermonkeyPath == null)
+                    throw new Exception("Spidermonkey not found in .jsvu directory");
+
+                if (!Directory.Exists(outputDir))
+                    Directory.CreateDirectory(outputDir);
+
+                var compileTier = args.Length > 3 ? args[3] : "stable";
+
+                var driverPath = Path.Combine(appDir, "spidermonkey-driver.js");
+                var smArgs = $"\"{driverPath}\" \"{modulePath}\" \"{outputDir}\\wasm\" {compileTier}";
+                var psi = new ProcessStartInfo(spidermonkeyPath, smArgs) {
+                    UseShellExecute = false,
+                    // CreateNoWindow = true
+                };
+
+                Console.WriteLine($"{spidermonkeyPath} {smArgs}");
+                using (var proc = Process.Start(psi))
+                    proc.WaitForExit();
             }
-
-            if (spidermonkeyPath == null)
-                throw new Exception("Spidermonkey not found in .jsvu directory");
-
-            if (!Directory.Exists(outputDir))
-                Directory.CreateDirectory(outputDir);
-
-            var compileTier = args.Length > 3 ? args[3] : "stable";
-
-            var driverPath = Path.Combine(appDir, "spidermonkey-driver.js");
-            var smArgs = $"\"{driverPath}\" \"{modulePath}\" \"{outputDir}\\wasm\" {compileTier}";
-            var psi = new ProcessStartInfo(spidermonkeyPath, smArgs) {
-                UseShellExecute = false,
-                // CreateNoWindow = true
-            };
-
-            Console.WriteLine($"{spidermonkeyPath} {smArgs}");
-            using (var proc = Process.Start(psi))
-                proc.WaitForExit();
-
-            var segmentsPath = Path.Combine(outputDir, "wasm.segments.json");
-            var binaryPath = Path.Combine(outputDir, "wasm.bin");
 
             if (!File.Exists(binaryPath) || !File.Exists(segmentsPath))
                 throw new Exception("Output from driver not found");
@@ -112,6 +136,7 @@ namespace WasmDis {
             }) {
                 var importCount = wasmReader.Imports.entries.Count(imp => imp.kind == external_kind.Function);
 
+                byte[] tempBuf = new byte[segments.Max(s => s.end - s.begin) + 1];
                 for (int i = 0; i < segments.Count; i++) {
                     var segment = segments[i];
                     if (!segment.funcBodyBegin.HasValue)
@@ -146,57 +171,44 @@ namespace WasmDis {
                         }
                     }
 
-                    const int decodeChunkSize = 512;
-                    var decodeOffset = offset;
-                    do {
-                        var insns = dis.Disassemble(compiledBytes, decodeOffset, decodeChunkSize);
+                    bool wasDead = false;
 
-                        var wasDead = false;
-                        for (int k = 0; k < insns.Length; k++) {
-                            var insn = insns[k];
-                            if (insn.Address >= endOffset)
-                                break;
-                            if ((k == insns.Length - 1) && ((insn.Address + insn.Bytes.Length) >= endOffset))
-                                break;
-
-                            // HACK: Strip dead instructions from the output because they're meaningless padding
-                            var isDead = (insn.Mnemonic == "hlt");
-                            if (isDead) {
-                                if (!wasDead)
-                                    outputStream.WriteLine("...");
-                                wasDead = isDead;
-                                continue;
-                            } else {
-                                wasDead = false;
-                            }
-
-                            // If an instruction's operand is an address assign it a meaningful name+offset label if possible by
-                            //  looking it up in our table of code segments
-                            var operand = insn.Operand;
-                            if (
-                                insn.HasDetails &&
-                                (insn.Details.Operands.Length == 1) &&
-                                (insn.Details.Operands[0].Type == X86OperandType.Immediate)
-                            ) {
-                                operand = MapOffset(insn.Details.Operands[0].Immediate, segments);
-                            }
-
-                            outputStream.WriteLine($"{insn.Address:X8}  {insn.Mnemonic} {operand}");
-                        }
-
-                        // If we decoded the requested number of instructions, there are probably more left so keep going
-                        if (insns.Length >= decodeChunkSize) {
-                            var lastInsn = insns[insns.Length - 1];
-                            var lastAddress = (int)(lastInsn.Address);
-                            var nextAddress = lastAddress + lastInsn.Bytes.Length;
-                            if (nextAddress >= endOffset)
-                                break;
-                            else
-                                decodeOffset = nextAddress;
-                        } else {
+                    // fixme: capstone is broken as hell why did I even expect a nuget library to work
+                    Array.Clear(tempBuf, 0, tempBuf.Length);
+                    Array.Copy(compiledBytes, offset, tempBuf, 0, count);
+                    
+                    foreach (var insn in dis.Iterate(tempBuf, 0)) {
+                        var relativeAddress = insn.Address;
+                        var absoluteAddress = relativeAddress + offset;
+                        if (absoluteAddress >= endOffset)
                             break;
+                        if ((absoluteAddress + insn.Bytes.Length) > endOffset)
+                            break;
+
+                        // HACK: Strip dead instructions from the output because they're meaningless padding
+                        var isDead = (insn.Mnemonic == "hlt");
+                        if (isDead) {
+                            if (!wasDead)
+                                outputStream.WriteLine("...");
+                            wasDead = isDead;
+                            continue;
+                        } else {
+                            wasDead = false;
                         }
-                    } while (true);
+
+                        // If an instruction's operand is an address assign it a meaningful name+offset label if possible by
+                        //  looking it up in our table of code segments
+                        var operand = insn.Operand;
+                        if (
+                            insn.HasDetails &&
+                            (insn.Details.Operands.Length == 1) &&
+                            (insn.Details.Operands[0].Type == X86OperandType.Immediate)
+                        ) {
+                            operand = MapOffset(insn.Details.Operands[0].Immediate, segments);
+                        }
+
+                        outputStream.WriteLine($"{absoluteAddress:X8}  {insn.Mnemonic} {operand}");
+                    }
 
                     outputStream.WriteLine($"// end of {name} @ {segment.funcBodyEnd.Value:X8}");
                     outputStream.WriteLine();
