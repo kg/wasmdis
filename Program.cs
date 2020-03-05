@@ -177,9 +177,9 @@ namespace WasmDis {
                     Array.Clear(tempBuf, 0, tempBuf.Length);
                     Array.Copy(compiledBytes, offset, tempBuf, 0, count);
                     
-                    foreach (var insn in dis.Iterate(tempBuf, 0)) {
-                        var relativeAddress = insn.Address;
-                        var absoluteAddress = relativeAddress + offset;
+                    foreach (var insn in dis.Iterate(tempBuf, offset)) {
+//                        var relativeAddress = insn.Address;
+                        var absoluteAddress = insn.Address;
                         if (absoluteAddress >= endOffset)
                             break;
                         if ((absoluteAddress + insn.Bytes.Length) > endOffset)
